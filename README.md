@@ -153,19 +153,32 @@ Also install the sentence embedder used for M1/M3 similarity:
 pip install sentence-transformers
 ```
 
-Then:
+Then run the pipeline. The `--dataset`/`--eval` defaults already point at the
+bundled `Hallulens Dataset/` folder, so the smoke test needs no paths.
+
+**Smoke test** — first 10 examples, fewer samples / shorter sequences, finishes
+in a couple of minutes; sanity-checks the GPU + AV server wiring end to end:
 
 ```bash
-# smoke test on the first 10 examples
-python run_rq2.py --limit 10 --k-samples 4
+python run_rq2.py --limit 10 --k-samples 4 --max-seq-tokens 64
+```
 
-# full run
+Check that `rq2_metrics.jsonl` has 10 rows with non-trivial M1/M2/M3 numbers,
+then do the full run.
+
+**Full run** — all 300 examples with the paper-faithful settings:
+
+```bash
 python run_rq2.py \
     --dataset "Hallulens Dataset/1_qwen7b_inference.jsonl" \
     --eval    "Hallulens Dataset/2_eval_results.json" \
     --output  rq2_metrics.jsonl \
     --k-samples 8 --max-tokens-per-token 64 --max-seq-tokens 512 --temperature 0.5
 ```
+
+> The full run verbalizes up to 512 token positions **per example** for M1, so it
+> makes thousands of AV calls. Expect it to take a while; start with the smoke
+> test. To trade coverage for speed, lower `--max-seq-tokens` (e.g. 128).
 
 `--temperature` (default **0.5**) applies to all three measures. It must stay
 **> 0** because M3 resamples the *same* activation and measures disagreement — at

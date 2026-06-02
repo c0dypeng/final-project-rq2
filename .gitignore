@@ -1,6 +1,3 @@
-# Ignored dataset folder
-Hallulens Dataset/
-
 # Python
 __pycache__/
 *.py[cod]
