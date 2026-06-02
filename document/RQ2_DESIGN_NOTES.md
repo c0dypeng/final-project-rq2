@@ -12,8 +12,11 @@ propensity to hallucinate.
 **Pipeline:** `run_rq2.py` extracts Qwen2.5-7B-Instruct layer-20 activations,
 verbalizes them through the vendored official NLA client (`nla_inference.py`,
 `NLAClientLP` subclass adds logprobs), computes three measures, and joins each
-row to the HalluLens hallucination labels (`halu_test_res` / `abstantion` →
-`hallucinated_strict = wrong AND not refusal`). Output: `rq2_metrics.jsonl`.
+row to the balanced HalluLens inline labels (`is_hallucinated` / `is_abstaining`
+→ `hallucinated_strict = wrong AND not refusal`). Dataset:
+`Balanced Hallulens Dataset/balanced_dataset.jsonl` (400 rows, 200/200 balanced,
+no abstentions). Output: `rq2_metrics.jsonl` (+ `rq2_metrics.last_act.npy` =
+last-token raw activations, row i ↔ example idx i).
 
 ---
 

@@ -7,6 +7,8 @@ venv/
 # Output
 result.txt
 rq2_metrics.jsonl
+rq2_metrics.last_act.npy
+*.last_act.npy
 
 # Downloaded NLA AV checkpoint (multi-GB; fetch via huggingface-cli)
 nla-qwen2.5-7b-L20-av/

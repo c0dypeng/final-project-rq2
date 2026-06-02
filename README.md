@@ -181,8 +181,9 @@ pip install sentence-transformers orjson pyyaml safetensors
 
 ### Run
 
-The `--dataset`/`--eval` defaults already point at the bundled
-`Hallulens Dataset/` folder, so the smoke test needs no paths.
+The `--dataset` default already points at the bundled
+`Balanced Hallulens Dataset/balanced_dataset.jsonl` (400 examples, balanced
+200 hallucination / 200 correct, inline labels), so the smoke test needs no paths.
 
 **Smoke test** — first 10 examples, fewer samples / shorter sequences, finishes
 in a couple of minutes; sanity-checks the GPU + AV server wiring end to end:
@@ -206,12 +207,11 @@ asserts for most such cases.
 Check that `rq2_metrics.jsonl` has 10 rows with non-trivial M1/M2/M3 numbers,
 then do the full run.
 
-**Full run** — all 300 examples with the paper-faithful settings:
+**Full run** — all 400 examples with the paper-faithful settings:
 
 ```bash
 python run_rq2.py \
-    --dataset "Hallulens Dataset/1_qwen7b_inference.jsonl" \
-    --eval    "Hallulens Dataset/2_eval_results.json" \
+    --dataset "Balanced Hallulens Dataset/balanced_dataset.jsonl" \
     --output  rq2_metrics.jsonl \
     --k-samples 8 --max-seq-tokens 512 --temperature 1.0
 ```
@@ -227,8 +227,7 @@ perplexity comparable to the paper. It must stay **> 0** because M3 resamples th
 so all `k` samples are identical (cosine 1.0, entropy 0) and M3 carries no signal.
 
 Add `--use-chat-template` to wrap each prompt with Qwen's chat template before
-extracting activations (matches how the answers in `1_qwen7b_inference.jsonl`
-were generated).
+extracting activations (matches how the answers in the dataset were generated).
 
 ### Output (`rq2_metrics.jsonl`)
 
@@ -236,9 +235,9 @@ One JSON object per example, e.g.:
 
 ```json
 {
-  "idx": 1, "prompt": "What was Real Chemistry formerly known as?",
-  "answer": "W2O Group", "halu_test_res": true, "abstantion": false,
-  "hallucinated_strict": true,
+  "idx": 1, "prompt": "What local name did the Philippine ... assign?",
+  "answer": "...", "label": "hallucination", "source": "original",
+  "is_hallucinated": true, "is_abstaining": false, "hallucinated_strict": true,
   "cross_token_mean_cosine": 0.41, "cross_token_semantic_entropy": 1.79,
   "mean_logp": -1.83, "perplexity": 6.23,
   "sampling_mean_cosine": 0.52, "sampling_semantic_entropy": 1.10,
@@ -246,8 +245,15 @@ One JSON object per example, e.g.:
 }
 ```
 
-`hallucinated_strict = halu_test_res AND NOT abstantion` — refusals are excluded
-from the hallucination set (in the raw eval, an abstention is sometimes counted
-as a hallucination). Use this field as the prediction target. The expected
-finding: hallucinated examples show **lower** cross-token/sampling cosine and
-**higher** entropy/perplexity than correct ones.
+`hallucinated_strict = is_hallucinated AND NOT is_abstaining`. The balanced
+dataset has no abstentions, so this equals `is_hallucinated`; the formula is kept
+for robustness. Use it as the prediction target. The expected finding:
+hallucinated examples show **lower** cross-token/sampling cosine and **higher**
+entropy/perplexity than correct ones.
+
+The AV text outputs (`thoughts_per_token`, `last_token_thought`, `samples`) are
+saved inline. The **raw last-token activation vectors** are written to a sidecar
+`rq2_metrics.last_act.npy` — a `[N, d_model]` float32 array where row
+`last_act_row` matches each record (~5.7 MB for 400×3584). Load with
+`np.load(...)` if you want to re-verbalize or probe activations without re-running
+the GPU extraction.

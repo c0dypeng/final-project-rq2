@@ -1,0 +1,27 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "target_per_class": 200,
+  "balanced_per_class": 200,
+  "pool_total": 2100,
+  "pool_counts": {
+    "correct": 221,
+    "hallucination": 1449,
+    "refusal": 430
+  },
+  "balanced_counts": {
+    "correct": {
+      "total": 200,
+      "original": 29,
+      "new": 171
+    },
+    "hallucination": {
+      "total": 200,
+      "original": 200,
+      "new": 0
+    }
+  },
+  "files": {
+    "pool": "output/precise_wikiqa_goodwiki_dynamic/Qwen2.5-7B-Instruct/balanced/pool.jsonl",
+    "balanced_dataset": "output/precise_wikiqa_goodwiki_dynamic/Qwen2.5-7B-Instruct/balanced/balanced_dataset.jsonl"
+  }
+}

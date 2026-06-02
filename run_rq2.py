@@ -28,18 +28,17 @@ For each example it:
            thought embeddings + a semantic-entropy estimate over clusters).
            High disagreement => unstable description => model uncertainty.
 
-  3. Joins each example's metrics with the dataset's hallucination labels
-     (halu_test_res, abstantion, correct) and writes one JSONL row per example.
+  3. Joins each example's metrics with the dataset's inline hallucination labels
+     (is_hallucinated, is_abstaining, label) and writes one JSONL row per example.
 
 The downstream question (done in a separate offline analysis): do M1/M2/M3
-predict halu_test_res?
+predict is_hallucinated?
 
 Usage:
     python run_rq2.py \
-        --dataset "Hallulens Dataset/1_qwen7b_inference.jsonl" \
-        --eval    "Hallulens Dataset/2_eval_results.json" \
+        --dataset "Balanced Hallulens Dataset/balanced_dataset.jsonl" \
         --output  rq2_metrics.jsonl \
-        --limit 50 --k-samples 8 --max-tokens-per-token 64
+        --limit 50 --k-samples 8
 """
 
 import argparse
@@ -85,10 +84,10 @@ SEMANTIC_CLUSTER_THRESHOLD = float(os.getenv("RQ2_CLUSTER_THRESHOLD", "0.8"))
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="RQ2 NLA prediction-stability pipeline.")
-    p.add_argument("--dataset", default="Hallulens Dataset/1_qwen7b_inference.jsonl",
-                   help="JSONL with prompt/answer/generation per example.")
-    p.add_argument("--eval", default="Hallulens Dataset/2_eval_results.json",
-                   help="Eval JSON with parallel halu_test_res / abstantion lists.")
+    p.add_argument("--dataset", default="Balanced Hallulens Dataset/balanced_dataset.jsonl",
+                   help="Balanced HalluLens JSONL: one self-contained record per "
+                        "example with prompt/answer/generation + inline labels "
+                        "(is_hallucinated, is_abstaining, label).")
     p.add_argument("--output", default="rq2_metrics.jsonl",
                    help="Output JSONL: one row of metrics + labels per example.")
     p.add_argument("--limit", type=int, default=0,
@@ -113,18 +112,19 @@ def parse_args() -> argparse.Namespace:
 
 
 # ---------------------------------------------------------------------------
-# Dataset loading + label join
+# Dataset loading
 # ---------------------------------------------------------------------------
-def load_dataset(dataset_path: str, eval_path: str) -> list[dict]:
+def load_dataset(dataset_path: str) -> list[dict]:
+    """Load the balanced HalluLens dataset (one self-contained record per line).
+
+    Each record carries inline labels: is_hallucinated (bool), is_abstaining
+    (bool), and label ("hallucination" | "correct" | ...). No separate eval file.
+    """
     rows = [json.loads(l) for l in open(dataset_path)]
-    ev = json.load(open(eval_path))
-
-    halu = ev.get("halu_test_res", [])
-    abst = ev.get("abstantion", [])
-    raw = ev.get("is_hallucinated_raw_generation", [])
-
     examples = []
     for i, r in enumerate(rows):
+        halu = r.get("is_hallucinated")
+        abst = r.get("is_abstaining")
         ex = {
             "idx": i,
             "title": r.get("title"),
@@ -132,14 +132,16 @@ def load_dataset(dataset_path: str, eval_path: str) -> list[dict]:
             "prompt": r["prompt"],
             "answer": r.get("answer"),
             "generation": r.get("generation"),
-            # labels (defensive about length mismatches)
-            "halu_test_res": bool(halu[i]) if i < len(halu) else None,
-            "abstantion": bool(abst[i]) if i < len(abst) else None,
-            "raw_label": raw[i] if i < len(raw) else None,
+            # inline labels
+            "is_hallucinated": bool(halu) if halu is not None else None,
+            "is_abstaining": bool(abst) if abst is not None else None,
+            "label": r.get("label"),
+            "source": r.get("source"),
         }
-        # "true" hallucination = wrong AND not a refusal
-        if ex["halu_test_res"] is not None and ex["abstantion"] is not None:
-            ex["hallucinated_strict"] = ex["halu_test_res"] and not ex["abstantion"]
+        # "true" hallucination = wrong AND not a refusal (this balanced set has
+        # no abstentions, so this equals is_hallucinated, but keep the formula).
+        if ex["is_hallucinated"] is not None and ex["is_abstaining"] is not None:
+            ex["hallucinated_strict"] = ex["is_hallucinated"] and not ex["is_abstaining"]
         else:
             ex["hallucinated_strict"] = None
         examples.append(ex)
@@ -420,7 +422,7 @@ def main():
     global _AV
     args = parse_args()
 
-    examples = load_dataset(args.dataset, args.eval)
+    examples = load_dataset(args.dataset)
     if args.limit > 0:
         examples = examples[: args.limit]
     print(f"Loaded {len(examples)} examples from {args.dataset}")
@@ -442,16 +444,18 @@ def main():
     _AV = NLAClientLP(AV_CHECKPOINT_DIR, sglang_url=AV_SGLANG_URL)
 
     out_f = open(args.output, "w")
+    last_acts = []   # raw last-token activations, one [d_model] row per example
     for ex in examples:
         idx = ex["idx"]
         print(f"\n[{idx}] {ex['prompt'][:80]!r} "
-              f"(halu={ex['halu_test_res']} abstain={ex['abstantion']})")
+              f"(label={ex['label']} halu={ex['is_hallucinated']} abstain={ex['is_abstaining']})")
 
         text = build_input_text(tokenizer, ex["prompt"], args.use_chat_template)
         acts, toks = extract_all_token_activations(
             model, tokenizer, text, QWEN_LAYER, QWEN_DEVICE
         )
         last_vec = acts[-1]   # raw; NLAClient rescales to injection_scale
+        last_acts.append(last_vec.astype(np.float32))
         print(f"  seq_len={acts.shape[0]} d_model={acts.shape[1]}")
 
         m1 = measure_cross_token(
@@ -485,11 +489,15 @@ def main():
             "prompt": ex["prompt"],
             "answer": ex["answer"],
             "generation": ex["generation"],
-            "halu_test_res": ex["halu_test_res"],
-            "abstantion": ex["abstantion"],
+            "label": ex["label"],
+            "source": ex["source"],
+            "is_hallucinated": ex["is_hallucinated"],
+            "is_abstaining": ex["is_abstaining"],
             "hallucinated_strict": ex["hallucinated_strict"],
             "seq_len": int(acts.shape[0]),
             "av_temperature": args.temperature,
+            # raw last-token activation lives in the .npy sidecar at this row
+            "last_act_row": len(last_acts) - 1,
             # M1
             "cross_token_mean_cosine": m1["cross_token_mean_cosine"],
             "cross_token_semantic_entropy": m1["cross_token_semantic_entropy"],
@@ -511,6 +519,14 @@ def main():
 
     out_f.close()
     print(f"\nMetrics written to {args.output}")
+
+    # Save raw last-token activations as a [N, d_model] float32 array. Row i
+    # corresponds to the record with "last_act_row": i. ~5.7 MB for 400x3584.
+    if last_acts:
+        act_path = args.output.rsplit(".", 1)[0] + ".last_act.npy"
+        np.save(act_path, np.stack(last_acts))
+        print(f"Last-token activations written to {act_path} "
+              f"(shape {len(last_acts)}x{last_acts[0].shape[0]})")
 
 
 if __name__ == "__main__":
