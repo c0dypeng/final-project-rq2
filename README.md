@@ -191,6 +191,18 @@ in a couple of minutes; sanity-checks the GPU + AV server wiring end to end:
 python run_rq2.py --limit 10 --k-samples 4 --max-seq-tokens 64
 ```
 
+**Sanity-check the injection.** On startup the client prints a banner like:
+
+```
+[NLAClient] nla-qwen2.5-7b-L20-av: d_model=3584 inj_scale=150.0 embed_scale=1.00 inj_char='㈎'(id=149705)
+```
+
+If `inj_scale`/`embed_scale`/`inj_char` look right **and** the first printed
+thought reads like 2-3 descriptive snippets (not gibberish or stray CJK), the
+activation injection is working. All-CJK or English-describing-a-CJK-char output
+means injection failed (template/tokenizer drift) — the client also raises loud
+asserts for most such cases.
+
 Check that `rq2_metrics.jsonl` has 10 rows with non-trivial M1/M2/M3 numbers,
 then do the full run.
 
