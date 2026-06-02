@@ -1,0 +1,59 @@
+services:
+
+  # ── AV SGLang server (GPU 1) ────────────────────────────────────────────
+  av_server:
+    image: lmsysorg/sglang:latest
+    container_name: av_server
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]   # GPU 1
+              capabilities: [gpu]
+    volumes:
+      - hf_cache:/cache/hf
+    environment:
+      - HF_HOME=/cache/hf
+    command: >
+      python -m sglang.launch_server
+        --model-path kitft/nla-qwen2.5-7b-L20-av
+        --port 30000
+        --disable-radix-cache
+        --dtype bfloat16
+    ports:
+      - "30000:30000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  # ── Pipeline runner (GPU 0) ─────────────────────────────────────────────
+  pipeline:
+    build: .
+    container_name: nla_pipeline
+    depends_on:
+      av_server:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]   # GPU 0
+              capabilities: [gpu]
+    volumes:
+      - hf_cache:/cache/hf
+      - ./:/app/data                   # mount project dir so input/output land on host
+    environment:
+      - HF_HOME=/cache/hf
+      - AV_SGLANG_URL=http://av_server:30000
+      - INPUT_FILE=${INPUT_FILE:-data/test.txt}
+      - OUTPUT_FILE=${OUTPUT_FILE:-data/result.txt}
+    command: python3 run_nla.py --input ${INPUT_FILE:-data/test.txt} --output ${OUTPUT_FILE:-data/result.txt}
+
+volumes:
+  hf_cache:

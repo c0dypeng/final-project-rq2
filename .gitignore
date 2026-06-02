@@ -1,0 +1,14 @@
+# Ignored dataset folder
+Hallulens Dataset/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Output
+result.txt
+
+# OS
+.DS_Store
