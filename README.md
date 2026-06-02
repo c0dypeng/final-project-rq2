@@ -9,18 +9,21 @@ Runs sentences through **Qwen2.5-7B-Instruct-AWQ** (GPU 0), extracts last-token 
 | File | Purpose |
 |------|---------|
 | `test.txt` | Input sentences (TSV: `index\tsentence`) |
-| `run_nla.py` | Basic pipeline script (one thought per sentence) |
 | `run_rq2.py` | **RQ2** stability pipeline (3 measures + dataset-label join) |
-| `result.txt` | `run_nla.py` output (`index\tactivation_l2\tthought`) |
+| `legacy/run_nla.py` | Original basic pipeline (one thought per sentence) |
+| `result.txt` | `legacy/run_nla.py` output (`index\tactivation_l2\tthought`) |
 | `rq2_metrics.jsonl` | `run_rq2.py` output (one metrics+labels row per example) |
 | `Dockerfile` | Container for the pipeline runner |
 | `docker-compose.yml` | Orchestrates AV server (GPU 1) + pipeline (GPU 0) |
 
 ---
 
-## Why AWQ?
+## Model precision
 
-The Qwen2.5-7B model in bfloat16 needs ~14 GB VRAM but the RTX 2080 Ti has 11 GB. The official `Qwen/Qwen2.5-7B-Instruct-AWQ` (int4) cuts that to ~4.5 GB, leaving headroom for the hidden-state extraction. The AV model runs separately on GPU 1 via SGLang.
+`run_rq2.py` loads the **full** `Qwen/Qwen2.5-7B-Instruct` in bfloat16 (~14 GB
+VRAM) for faithful activations. The legacy `legacy/run_nla.py` uses the int4 AWQ
+build (`Qwen/Qwen2.5-7B-Instruct-AWQ`, ~4.5 GB) for fitting an 11 GB RTX 2080 Ti.
+The AV model runs separately on GPU 1 via SGLang.
 
 ---
 
@@ -71,12 +74,16 @@ Wait for `Server is ready` in the logs.
 
 ### 3. Run the pipeline
 
+For RQ2, see the [RQ2 section](#rq2-nla-prediction-stability-run_rq2py) below.
+
+The legacy basic pipeline:
+
 ```bash
 # defaults
-python run_nla.py
+python legacy/run_nla.py
 
 # custom files
-python run_nla.py --input my_sentences.txt --output my_results.txt
+python legacy/run_nla.py --input my_sentences.txt --output my_results.txt
 ```
 
 The `AV_SGLANG_URL` env var controls the server address (default: `http://localhost:30000`).
@@ -157,8 +164,13 @@ python run_rq2.py \
     --dataset "Hallulens Dataset/1_qwen7b_inference.jsonl" \
     --eval    "Hallulens Dataset/2_eval_results.json" \
     --output  rq2_metrics.jsonl \
-    --k-samples 8 --max-tokens-per-token 64 --max-seq-tokens 64
+    --k-samples 8 --max-tokens-per-token 64 --max-seq-tokens 512 --temperature 0.5
 ```
+
+`--temperature` (default **0.5**) applies to all three measures. It must stay
+**> 0** because M3 resamples the *same* activation and measures disagreement — at
+`T=0` the AV is deterministic, so all `k` samples are identical (cosine 1.0,
+entropy 0) and M3 carries no signal.
 
 Add `--use-chat-template` to wrap each prompt with Qwen's chat template before
 extracting activations (matches how the answers in `1_qwen7b_inference.jsonl`

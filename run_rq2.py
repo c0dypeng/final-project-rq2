@@ -54,7 +54,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # ---------------------------------------------------------------------------
 # Config (mirrors run_nla.py)
 # ---------------------------------------------------------------------------
-QWEN_MODEL = "Qwen/Qwen2.5-7B-Instruct-AWQ"
+QWEN_MODEL = "Qwen/Qwen2.5-7B-Instruct"  # full bf16 weights (not AWQ)
 QWEN_LAYER = 20
 QWEN_DEVICE = "cuda:0"
 
@@ -84,8 +84,10 @@ def parse_args() -> argparse.Namespace:
                    help="M1: max_new_tokens when verbalizing each token (kept short for speed).")
     p.add_argument("--max-tokens", type=int, default=200,
                    help="M2/M3: max_new_tokens for full last-token thoughts.")
-    p.add_argument("--max-seq-tokens", type=int, default=64,
+    p.add_argument("--max-seq-tokens", type=int, default=512,
                    help="M1: cap number of token positions verbalized per example.")
+    p.add_argument("--temperature", type=float, default=0.5,
+                   help="AV sampling temperature for all measures (M3 needs >0 to vary).")
     p.add_argument("--use-chat-template", action="store_true",
                    help="Wrap the prompt with Qwen's chat template before extracting activations.")
     return p.parse_args()
@@ -302,7 +304,7 @@ def semantic_entropy(emb: np.ndarray, threshold: float = 0.7) -> float:
 # ---------------------------------------------------------------------------
 def measure_cross_token(
     acts: np.ndarray, av_model_path: str, sglang_url: str,
-    max_new_tokens: int, max_positions: int,
+    max_new_tokens: int, max_positions: int, temperature: float,
 ) -> dict:
     """M1: verbalize each token's activation, embed, measure cross-token agreement."""
     seq_len = acts.shape[0]
@@ -317,7 +319,7 @@ def measure_cross_token(
     for pos in positions:
         vec = normalize_activation(acts[pos], AV_TARGET_NORM)
         out = av_generate(vec, av_model_path, sglang_url,
-                          max_new_tokens=max_new_tokens, temperature=0.0)
+                          max_new_tokens=max_new_tokens, temperature=temperature)
         thoughts.append(out["text"])
 
     emb = embed_texts(thoughts)
@@ -330,11 +332,12 @@ def measure_cross_token(
 
 
 def measure_perplexity(
-    last_vec: np.ndarray, av_model_path: str, sglang_url: str, max_new_tokens: int,
+    last_vec: np.ndarray, av_model_path: str, sglang_url: str,
+    max_new_tokens: int, temperature: float,
 ) -> dict:
     """M2: average log-p / perplexity of the AV's last-token thought."""
     out = av_generate(last_vec, av_model_path, sglang_url,
-                      max_new_tokens=max_new_tokens, temperature=0.0,
+                      max_new_tokens=max_new_tokens, temperature=temperature,
                       return_logprob=True)
     lps = out.get("logprobs", [])
     if lps:
@@ -353,13 +356,17 @@ def measure_perplexity(
 
 def measure_sampling_stability(
     last_vec: np.ndarray, av_model_path: str, sglang_url: str,
-    max_new_tokens: int, k: int,
+    max_new_tokens: int, k: int, temperature: float,
 ) -> dict:
-    """M3: sample the AV k times at T=1 for the same activation, measure agreement."""
+    """M3: sample the AV k times for the same activation, measure agreement.
+
+    Requires temperature > 0, otherwise every sample is identical and the
+    measure degenerates (cosine=1.0, entropy=0).
+    """
     samples = []
     for _ in range(k):
         out = av_generate(last_vec, av_model_path, sglang_url,
-                          max_new_tokens=max_new_tokens, temperature=1.0)
+                          max_new_tokens=max_new_tokens, temperature=temperature)
         samples.append(out["text"])
     emb = embed_texts(samples)
     return {
@@ -394,10 +401,16 @@ def main():
     if args.limit > 0:
         examples = examples[: args.limit]
     print(f"Loaded {len(examples)} examples from {args.dataset}")
+    print(f"AV temperature={args.temperature}  max_seq_tokens={args.max_seq_tokens}  k={args.k_samples}")
+    if args.temperature <= 0.0:
+        print("  [WARN] temperature=0 makes M3 (sampling stability) degenerate: "
+              "all k samples will be identical (cosine=1.0, entropy=0).")
 
     print(f"\nLoading {QWEN_MODEL} on {QWEN_DEVICE} ...")
     tokenizer = AutoTokenizer.from_pretrained(QWEN_MODEL)
-    model = AutoModelForCausalLM.from_pretrained(QWEN_MODEL, device_map=QWEN_DEVICE)
+    model = AutoModelForCausalLM.from_pretrained(
+        QWEN_MODEL, torch_dtype=torch.bfloat16, device_map=QWEN_DEVICE,
+    )
     model.eval()
     print("Qwen loaded.")
 
@@ -420,13 +433,16 @@ def main():
             acts, AV_MODEL, AV_SGLANG_URL,
             max_new_tokens=args.max_tokens_per_token,
             max_positions=args.max_seq_tokens,
+            temperature=args.temperature,
         )
         m2 = measure_perplexity(
             last_vec, AV_MODEL, AV_SGLANG_URL, max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
         )
         m3 = measure_sampling_stability(
             last_vec, AV_MODEL, AV_SGLANG_URL,
             max_new_tokens=args.max_tokens, k=args.k_samples,
+            temperature=args.temperature,
         )
 
         print(f"  M1 cross-token cosine={m1['cross_token_mean_cosine']:.3f} "
@@ -448,6 +464,7 @@ def main():
             "abstantion": ex["abstantion"],
             "hallucinated_strict": ex["hallucinated_strict"],
             "seq_len": int(acts.shape[0]),
+            "av_temperature": args.temperature,
             # M1
             "cross_token_mean_cosine": m1["cross_token_mean_cosine"],
             "cross_token_semantic_entropy": m1["cross_token_semantic_entropy"],
