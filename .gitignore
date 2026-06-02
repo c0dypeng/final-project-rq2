@@ -9,6 +9,7 @@ venv/
 
 # Output
 result.txt
+rq2_metrics.jsonl
 
 # OS
 .DS_Store

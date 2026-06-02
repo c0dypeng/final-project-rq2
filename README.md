@@ -9,8 +9,10 @@ Runs sentences through **Qwen2.5-7B-Instruct-AWQ** (GPU 0), extracts last-token 
 | File | Purpose |
 |------|---------|
 | `test.txt` | Input sentences (TSV: `index\tsentence`) |
-| `run_nla.py` | Pipeline script |
-| `result.txt` | Output (created after a run: `index\tactivation_l2\tthought`) |
+| `run_nla.py` | Basic pipeline script (one thought per sentence) |
+| `run_rq2.py` | **RQ2** stability pipeline (3 measures + dataset-label join) |
+| `result.txt` | `run_nla.py` output (`index\tactivation_l2\tthought`) |
+| `rq2_metrics.jsonl` | `run_rq2.py` output (one metrics+labels row per example) |
 | `Dockerfile` | Container for the pipeline runner |
 | `docker-compose.yml` | Orchestrates AV server (GPU 1) + pipeline (GPU 0) |
 
@@ -109,3 +111,77 @@ index	activation_l2	thought
 |---------|-----|-------|
 | Pipeline runner | GPU 0 | Qwen2.5-7B-Instruct-AWQ (int4, ~4.5 GB) |
 | AV SGLang server | GPU 1 | kitft/nla-qwen2.5-7b-L20-av (bfloat16) |
+
+---
+
+## RQ2: NLA Prediction Stability (`run_rq2.py`)
+
+**Hypothesis:** NLA's stability in describing activations reflects the target
+model's uncertainty — and therefore its propensity to hallucinate.
+
+For each example in the HalluLens dataset, `run_rq2.py` extracts Qwen's layer-20
+activations and computes three stability measures via the AV server, then joins
+each row with the dataset's hallucination labels so the signals can be
+correlated against ground truth offline.
+
+| Measure | What it computes | Intuition |
+|---------|------------------|-----------|
+| **M1 cross-token similarity** | Verbalize *every* token's activation, embed the thoughts, report mean pairwise cosine + a semantic-entropy estimate | The NLA paper notes claims recurring across adjacent tokens are more reliable; low cross-token agreement ⇒ unstable internal "story" |
+| **M2 perplexity** | Ask the AV for token logprobs on the last-token thought; report mean log-p and `exp(−mean log-p)` | High perplexity ⇒ the verbalizer is unsure how to describe the activation |
+| **M3 sampling stability** | Sample the AV `k` times at `T=1` for the same activation; report mean pairwise cosine + semantic entropy over the `k` thoughts | High disagreement across samples ⇒ unstable description ⇒ model uncertainty |
+
+### Run
+
+The AV SGLang server must be started **with logprobs enabled** (M2 needs them):
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python -m sglang.launch_server \
+    --model-path kitft/nla-qwen2.5-7b-L20-av \
+    --port 30000 --disable-radix-cache --dtype bfloat16
+```
+
+Also install the sentence embedder used for M1/M3 similarity:
+
+```bash
+pip install sentence-transformers
+```
+
+Then:
+
+```bash
+# smoke test on the first 10 examples
+python run_rq2.py --limit 10 --k-samples 4
+
+# full run
+python run_rq2.py \
+    --dataset "Hallulens Dataset/1_qwen7b_inference.jsonl" \
+    --eval    "Hallulens Dataset/2_eval_results.json" \
+    --output  rq2_metrics.jsonl \
+    --k-samples 8 --max-tokens-per-token 64 --max-seq-tokens 64
+```
+
+Add `--use-chat-template` to wrap each prompt with Qwen's chat template before
+extracting activations (matches how the answers in `1_qwen7b_inference.jsonl`
+were generated).
+
+### Output (`rq2_metrics.jsonl`)
+
+One JSON object per example, e.g.:
+
+```json
+{
+  "idx": 1, "prompt": "What was Real Chemistry formerly known as?",
+  "answer": "W2O Group", "halu_test_res": true, "abstantion": false,
+  "hallucinated_strict": true,
+  "cross_token_mean_cosine": 0.41, "cross_token_semantic_entropy": 1.79,
+  "mean_logp": -1.83, "perplexity": 6.23,
+  "sampling_mean_cosine": 0.52, "sampling_semantic_entropy": 1.10,
+  "last_token_thought": "...", "thoughts_per_token": ["..."], "samples": ["..."]
+}
+```
+
+`hallucinated_strict = halu_test_res AND NOT abstantion` — refusals are excluded
+from the hallucination set (in the raw eval, an abstention is sometimes counted
+as a hallucination). Use this field as the prediction target. The expected
+finding: hallucinated examples show **lower** cross-token/sampling cosine and
+**higher** entropy/perplexity than correct ones.
