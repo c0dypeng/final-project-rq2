@@ -60,8 +60,25 @@ QWEN_DEVICE = "cuda:0"
 
 AV_MODEL = "kitft/nla-qwen2.5-7b-L20-av"
 AV_SGLANG_URL = os.getenv("AV_SGLANG_URL", "http://localhost:30000")
-AV_TARGET_NORM = 150.0
-AV_INJECT_CHAR = "㈎"
+AV_TARGET_NORM = 150.0       # injection_scale from nla_meta.yaml
+AV_INJECT_CHAR = "㈎"        # injection_char from nla_meta.yaml (token id 149705)
+
+# The AV's RL-training prompt, taken verbatim from the checkpoint's
+# nla_meta.yaml (prompt_templates.av). The activation is injected at the
+# {injection_char} marker, inside <concept> tags. Using anything else feeds
+# the RL-trained model an out-of-distribution context and degrades outputs.
+AV_PROMPT_TEMPLATE = (
+    "You are a meticulous AI researcher conducting an important investigation "
+    "into activation vectors from a language model. Your overall task is to "
+    "describe the semantic content of that activation vector.\n\n"
+    "We will pass the vector enclosed in <concept> tags into your context. You "
+    "must then produce an explanation for the vector, enclosed within "
+    "<explanation> tags. The explanation consists of 2-3 text snippets "
+    "describing that vector.\n\n"
+    "Here is the vector:\n\n"
+    "<concept>{injection_char}</concept>\n\n"
+    "Please provide an explanation."
+)
 
 # Sentence embedder for semantic similarity (small, CPU-friendly).
 EMBED_MODEL = os.getenv("RQ2_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
@@ -178,21 +195,50 @@ def _get_av_embed(av_model_path: str):
 
 
 def _build_av_embeds(vec: np.ndarray, av_model_path: str) -> np.ndarray:
-    """Build the [L, d_model] input-embeds for the AV prompt with `vec` injected."""
+    """Build the [L, d_model] input-embeds for the AV prompt with `vec` injected.
+
+    Uses the checkpoint's RL-training prompt (AV_PROMPT_TEMPLATE) wrapped in the
+    AV's own chat template, then overwrites the single injection-marker token's
+    embedding with the activation `vec`.
+    """
     tok, embed_weight = _get_av_embed(av_model_path)
-    prompt_template = (
-        f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-        f"<|im_start|>user\n"
-        f"Describe the information encoded in this activation: {AV_INJECT_CHAR}<|im_end|>\n"
-        f"<|im_start|>assistant\n<explanation>"
+
+    user_content = AV_PROMPT_TEMPLATE.format(injection_char=AV_INJECT_CHAR)
+    messages = [{"role": "user", "content": user_content}]
+    prompt = tok.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
-    token_ids = tok(prompt_template, return_tensors="pt").input_ids[0]
+    # The AV is trained to emit its answer inside <explanation> tags; priming
+    # the assistant turn with the opening tag matches that and stabilizes output.
+    prompt = prompt + "<explanation>"
+
+    token_ids = tok(prompt, return_tensors="pt", add_special_tokens=False).input_ids[0]
     embeds = embed_weight[token_ids].float().numpy()
-    inject_id = tok.convert_tokens_to_ids(AV_INJECT_CHAR)
-    positions = (token_ids == inject_id).nonzero(as_tuple=True)[0]
-    if len(positions) == 0:
-        raise ValueError(f"Injection character '{AV_INJECT_CHAR}' not found in tokenized prompt.")
-    embeds[int(positions[0])] = vec
+
+    # Locate the injection marker by matching its encoded id(s) against the
+    # token list (tensor-safe; never compare a tensor to a bare int via ==).
+    ids = token_ids.tolist()
+    marker_ids = tok(AV_INJECT_CHAR, add_special_tokens=False).input_ids
+    inject_pos = None
+    if len(marker_ids) == 1:
+        target = marker_ids[0]
+        for i, t in enumerate(ids):
+            if t == target:
+                inject_pos = i
+                break
+    else:
+        n = len(marker_ids)
+        for i in range(len(ids) - n + 1):
+            if ids[i:i + n] == marker_ids:
+                inject_pos = i
+                break
+
+    if inject_pos is None:
+        raise ValueError(
+            f"Injection marker {AV_INJECT_CHAR!r} (ids={marker_ids}) not found in "
+            f"tokenized prompt (ids={ids})."
+        )
+    embeds[inject_pos] = vec
     return embeds
 
 
