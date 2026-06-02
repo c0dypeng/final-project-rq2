@@ -1,4 +1,0 @@
-index	sentence
-0	The quick brown fox jumps over the lazy dog.
-1	Artificial intelligence is reshaping how humans interact with machines.
-2	Language models encode surprisingly rich semantic structure in their hidden states.

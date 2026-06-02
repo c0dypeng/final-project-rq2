@@ -213,17 +213,18 @@ python run_rq2.py \
     --dataset "Hallulens Dataset/1_qwen7b_inference.jsonl" \
     --eval    "Hallulens Dataset/2_eval_results.json" \
     --output  rq2_metrics.jsonl \
-    --k-samples 8 --max-tokens-per-token 64 --max-seq-tokens 512 --temperature 0.5
+    --k-samples 8 --max-seq-tokens 512 --temperature 1.0
 ```
 
 > The full run verbalizes up to 512 token positions **per example** for M1, so it
 > makes thousands of AV calls. Expect it to take a while; start with the smoke
 > test. To trade coverage for speed, lower `--max-seq-tokens` (e.g. 128).
 
-`--temperature` (default **0.5**) applies to all three measures. It must stay
-**> 0** because M3 resamples the *same* activation and measures disagreement — at
-`T=0` the AV is deterministic, so all `k` samples are identical (cosine 1.0,
-entropy 0) and M3 carries no signal.
+`--temperature` (default **1.0**) applies to all three measures. T=1 matches the
+AV's trained sampling distribution (the NLA paper samples at T=1), which keeps M2
+perplexity comparable to the paper. It must stay **> 0** because M3 resamples the
+*same* activation and measures disagreement — at `T=0` the AV is deterministic,
+so all `k` samples are identical (cosine 1.0, entropy 0) and M3 carries no signal.
 
 Add `--use-chat-template` to wrap each prompt with Qwen's chat template before
 extracting activations (matches how the answers in `1_qwen7b_inference.jsonl`

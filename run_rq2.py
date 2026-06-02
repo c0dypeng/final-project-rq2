@@ -86,14 +86,18 @@ def parse_args() -> argparse.Namespace:
                    help="Process only the first N examples (0 = all).")
     p.add_argument("--k-samples", type=int, default=8,
                    help="M3: number of AV samples per activation at T=1.")
-    p.add_argument("--max-tokens-per-token", type=int, default=64,
-                   help="M1: max_new_tokens when verbalizing each token (kept short for speed).")
-    p.add_argument("--max-tokens", type=int, default=200,
+    p.add_argument("--max-tokens-per-token", type=int, default=512,
+                   help="M1: max_new_tokens when verbalizing each token "
+                        "(enough to emit the closing </explanation> tag).")
+    p.add_argument("--max-tokens", type=int, default=512,
                    help="M2/M3: max_new_tokens for full last-token thoughts.")
     p.add_argument("--max-seq-tokens", type=int, default=512,
                    help="M1: cap number of token positions verbalized per example.")
-    p.add_argument("--temperature", type=float, default=0.5,
-                   help="AV sampling temperature for all measures (M3 needs >0 to vary).")
+    p.add_argument("--temperature", type=float, default=1.0,
+                   help="AV sampling temperature for all measures. 1.0 matches the "
+                        "AV's trained sampling distribution (the NLA paper samples "
+                        "at T=1), which keeps M2 perplexity comparable to the paper. "
+                        "Must be >0 so M3 sampling stability is non-degenerate.")
     p.add_argument("--use-chat-template", action="store_true",
                    help="Wrap the prompt with Qwen's chat template before extracting activations.")
     return p.parse_args()
@@ -217,18 +221,33 @@ class NLAClientLP(NLAClient):
 _AV: NLAClientLP | None = None
 
 
+def _strip_explanation_tags(text: str) -> str:
+    """Remove stray <explanation>/</explanation> tags.
+
+    NLAClient.generate() only strips tags when BOTH are present; if generation
+    truncates before the closing tag it falls back to returning the raw text,
+    which still carries the leading '<explanation>' opener. That stray tag would
+    pollute the sentence embeddings (every truncated thought shares it), so we
+    strip it here as defense-in-depth on top of the larger token budget.
+    """
+    text = text.replace("<explanation>", "").replace("</explanation>", "")
+    return text.strip()
+
+
 def av_text(vec: np.ndarray, max_new_tokens: int, temperature: float) -> str:
     """Verbalize one RAW activation vector (NLAClient rescales it internally)."""
-    return _AV.generate(
-        vec, max_new_tokens=max_new_tokens, temperature=temperature
+    return _strip_explanation_tags(
+        _AV.generate(vec, max_new_tokens=max_new_tokens, temperature=temperature)
     )
 
 
 def av_text_logprob(vec: np.ndarray, max_new_tokens: int, temperature: float) -> dict:
     """Verbalize one RAW activation, returning {text, logprobs}."""
-    return _AV.generate_with_logprob(
+    out = _AV.generate_with_logprob(
         vec, max_new_tokens=max_new_tokens, temperature=temperature
     )
+    out["text"] = _strip_explanation_tags(out["text"])
+    return out
 
 
 # ---------------------------------------------------------------------------
