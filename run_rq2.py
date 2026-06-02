@@ -69,9 +69,18 @@ QWEN_DEVICE = "cuda:0"
 AV_CHECKPOINT_DIR = os.getenv("AV_CHECKPOINT_DIR", "./nla-qwen2.5-7b-L20-av")
 AV_SGLANG_URL = os.getenv("AV_SGLANG_URL", "http://localhost:30000")
 
-# Sentence embedder for semantic similarity (small, CPU-friendly).
-EMBED_MODEL = os.getenv("RQ2_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+# Sentence embedder for semantic similarity. all-mpnet-base-v2 is the strongest
+# general-purpose sentence-transformer; it separates *meaning* better than the
+# smaller all-MiniLM-L6-v2 (which tends to score stylistically-similar but
+# semantically-different texts as similar — a real concern here since every NLA
+# "thought" shares the same template style). Override via RQ2_EMBED_MODEL.
+EMBED_MODEL = os.getenv("RQ2_EMBED_MODEL", "sentence-transformers/all-mpnet-base-v2")
 EMBED_DEVICE = os.getenv("RQ2_EMBED_DEVICE", "cuda:0")
+
+# Cosine cutoff for clustering "same-meaning" thoughts in semantic_entropy().
+# Hand-picked (not calibrated). 0.8 suits all-mpnet's wider similarity spread;
+# recalibrate from the observed pairwise-cosine distribution after a real run.
+SEMANTIC_CLUSTER_THRESHOLD = float(os.getenv("RQ2_CLUSTER_THRESHOLD", "0.8"))
 
 
 def parse_args() -> argparse.Namespace:
@@ -283,11 +292,17 @@ def mean_pairwise_cosine(emb: np.ndarray) -> float:
     return float(sims[iu].mean())
 
 
-def semantic_entropy(emb: np.ndarray, threshold: float = 0.7) -> float:
+def semantic_entropy(emb: np.ndarray, threshold: float = SEMANTIC_CLUSTER_THRESHOLD) -> float:
     """Cluster thoughts by cosine threshold; return entropy (nats) over cluster sizes.
 
     0 => all thoughts mean the same thing (stable). Higher => more distinct
     meanings (unstable). A cheap stand-in for Kuhn et al. semantic entropy.
+
+    NOTE: `threshold` is a hand-picked constant (SEMANTIC_CLUSTER_THRESHOLD),
+    NOT calibrated to the embedder's similarity distribution. With all-MiniLM at
+    0.7 it collapsed everything into one cluster (entropy ~0); 0.8 with the
+    stronger all-mpnet embedder should separate distinct meanings. Treat entropy
+    as a SECONDARY signal — mean_pairwise_cosine is the primary M1/M3 metric.
     """
     n = emb.shape[0]
     if n < 2:
