@@ -19,3 +19,4 @@
 - [Proposal (slides)](https://docs.google.com/presentation/d/1-N4lBLNEj-w4oko5wDnjc8ufo4khvwngvcU5RuXHDJc/edit?slide=id.g3e128f03443_1_35#slide=id.g3e128f03443_1_35)
 - [NLA Paper — Transformer Circuits, 2026](https://transformer-circuits.pub/2026/nla/)
 - [GitHub: kitft/natural_language_autoencoders](https://github.com/kitft/natural_language_autoencoders)
+- [GitHub: kitft/nla-inference](https://github.com/kitft/nla-inference)

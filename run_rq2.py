@@ -4,11 +4,12 @@ RQ2: NLA Prediction Stability
 Hypothesis: NLA's stability in describing activation(s) reflects the target
 model's uncertainty (and, downstream, its propensity to hallucinate).
 
-This pipeline extends run_nla.py. For each example it:
+For each example it:
 
-  1. Runs the prompt through Qwen2.5-7B-Instruct-AWQ (GPU 0) and extracts
+  1. Runs the prompt through Qwen2.5-7B-Instruct (full bf16, GPU 0) and extracts
      the layer-20 residual-stream activation at EVERY token (not just the last).
-  2. Computes three NLA stability measures via the AV SGLang server (GPU 1):
+  2. Computes three NLA stability measures by verbalizing activations through
+     the vendored NLAClient (nla_inference.py) against the AV SGLang server:
 
        M1  cross-token semantic similarity
            Verbalize each token's activation, embed the thoughts, and measure
@@ -51,34 +52,22 @@ import torch
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from nla_inference import NLAClient, EXPLANATION_RE
+
 # ---------------------------------------------------------------------------
-# Config (mirrors run_nla.py)
+# Config
 # ---------------------------------------------------------------------------
 QWEN_MODEL = "Qwen/Qwen2.5-7B-Instruct"  # full bf16 weights (not AWQ)
 QWEN_LAYER = 20
 QWEN_DEVICE = "cuda:0"
 
-AV_MODEL = "kitft/nla-qwen2.5-7b-L20-av"
+# AV checkpoint dir (HF-format, must contain nla_meta.yaml). The vendored
+# NLAClient reads the prompt template, injection char/scale, and the
+# neighbor-verified injection position from that sidecar automatically — we no
+# longer hardcode any of them. Point this at a local clone of
+# kitft/nla-qwen2.5-7b-L20-av (e.g. `huggingface-cli download ... --local-dir`).
+AV_CHECKPOINT_DIR = os.getenv("AV_CHECKPOINT_DIR", "./nla-qwen2.5-7b-L20-av")
 AV_SGLANG_URL = os.getenv("AV_SGLANG_URL", "http://localhost:30000")
-AV_TARGET_NORM = 150.0       # injection_scale from nla_meta.yaml
-AV_INJECT_CHAR = "㈎"        # injection_char from nla_meta.yaml (token id 149705)
-
-# The AV's RL-training prompt, taken verbatim from the checkpoint's
-# nla_meta.yaml (prompt_templates.av). The activation is injected at the
-# {injection_char} marker, inside <concept> tags. Using anything else feeds
-# the RL-trained model an out-of-distribution context and degrades outputs.
-AV_PROMPT_TEMPLATE = (
-    "You are a meticulous AI researcher conducting an important investigation "
-    "into activation vectors from a language model. Your overall task is to "
-    "describe the semantic content of that activation vector.\n\n"
-    "We will pass the vector enclosed in <concept> tags into your context. You "
-    "must then produce an explanation for the vector, enclosed within "
-    "<explanation> tags. The explanation consists of 2-3 text snippets "
-    "describing that vector.\n\n"
-    "Here is the vector:\n\n"
-    "<concept>{injection_char}</concept>\n\n"
-    "Please provide an explanation."
-)
 
 # Sentence embedder for semantic similarity (small, CPU-friendly).
 EMBED_MODEL = os.getenv("RQ2_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
@@ -168,122 +157,78 @@ def extract_all_token_activations(
     return hidden.float().cpu().numpy(), toks
 
 
-def normalize_activation(vec: np.ndarray, target_norm: float) -> np.ndarray:
-    l2 = float(np.linalg.norm(vec))
-    if l2 == 0:
-        return vec
-    return vec * (target_norm / l2)
-
-
 # ---------------------------------------------------------------------------
-# AV server interface (text + optional logprobs)
+# AV interface — thin wrapper over the vendored NLAClient
 # ---------------------------------------------------------------------------
-_av_cache: dict = {}
+# The vendored NLAClient (nla_inference.py) owns everything checkpoint-specific:
+# it reads nla_meta.yaml for the trained prompt template, the injection char and
+# its neighbor ids, the injection scale (L2 norm the model expects), and the
+# architecture embed scale. We add ONE thing it lacks — logprobs, needed for the
+# M2 perplexity measure — by subclassing and re-implementing the single SGLang
+# call with return_logprob.
 
+class NLAClientLP(NLAClient):
+    """NLAClient + generate_with_logprob() for the M2 perplexity measure."""
 
-def _get_av_embed(av_model_path: str):
-    if av_model_path not in _av_cache:
-        print(f"  [AV] Loading tokenizer + embedding from {av_model_path} ...")
-        tok = AutoTokenizer.from_pretrained(av_model_path)
-        m = AutoModelForCausalLM.from_pretrained(
-            av_model_path, torch_dtype=torch.float32, device_map="cpu",
+    def generate_with_logprob(
+        self, activation, *, extract_explanation: bool = True, **sampling
+    ) -> dict:
+        """Like generate(), but also returns the generated tokens' logprobs.
+
+        Returns {"text": str, "logprobs": list[float]}.
+        """
+        v = torch.as_tensor(np.asarray(activation, dtype=np.float32))
+        assert v.numel() == self.cfg.d_model, (
+            f"activation length {v.numel()} != d_model {self.cfg.d_model}"
         )
-        embed_weight = m.model.embed_tokens.weight.detach()
-        del m
-        _av_cache[av_model_path] = (tok, embed_weight)
-    return _av_cache[av_model_path]
+        embeds_np, prompt_len = self._build_embeds(v, None)
 
-
-def _build_av_embeds(vec: np.ndarray, av_model_path: str) -> np.ndarray:
-    """Build the [L, d_model] input-embeds for the AV prompt with `vec` injected.
-
-    Uses the checkpoint's RL-training prompt (AV_PROMPT_TEMPLATE) wrapped in the
-    AV's own chat template, then overwrites the single injection-marker token's
-    embedding with the activation `vec`.
-    """
-    tok, embed_weight = _get_av_embed(av_model_path)
-
-    user_content = AV_PROMPT_TEMPLATE.format(injection_char=AV_INJECT_CHAR)
-    messages = [{"role": "user", "content": user_content}]
-    prompt = tok.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    # The AV is trained to emit its answer inside <explanation> tags; priming
-    # the assistant turn with the opening tag matches that and stabilizes output.
-    prompt = prompt + "<explanation>"
-
-    token_ids = tok(prompt, return_tensors="pt", add_special_tokens=False).input_ids[0]
-    embeds = embed_weight[token_ids].float().numpy()
-
-    # Locate the injection marker by matching its encoded id(s) against the
-    # token list (tensor-safe; never compare a tensor to a bare int via ==).
-    ids = token_ids.tolist()
-    marker_ids = tok(AV_INJECT_CHAR, add_special_tokens=False).input_ids
-    inject_pos = None
-    if len(marker_ids) == 1:
-        target = marker_ids[0]
-        for i, t in enumerate(ids):
-            if t == target:
-                inject_pos = i
-                break
-    else:
-        n = len(marker_ids)
-        for i in range(len(ids) - n + 1):
-            if ids[i:i + n] == marker_ids:
-                inject_pos = i
-                break
-
-    if inject_pos is None:
-        raise ValueError(
-            f"Injection marker {AV_INJECT_CHAR!r} (ids={marker_ids}) not found in "
-            f"tokenized prompt (ids={ids})."
+        sp = {"temperature": 1.0, "max_new_tokens": 200,
+              "skip_special_tokens": False}
+        sp.update(sampling)
+        payload = {
+            "input_embeds": embeds_np.tolist(),
+            "sampling_params": sp,
+            "return_logprob": True,
+            # only score generated tokens, not the injected prompt
+            "logprob_start_len": int(prompt_len),
+        }
+        resp = self._http.post(
+            f"{self.sglang_url}/generate",
+            json=payload, headers={"Content-Type": "application/json"},
         )
-    embeds[inject_pos] = vec
-    return embeds
+        resp.raise_for_status()
+        out = resp.json()
+        out = out[0] if isinstance(out, list) else out
 
-
-def _clean_thought(text: str) -> str:
-    if "</explanation>" in text:
-        text = text.split("</explanation>")[0]
-    return text.strip()
-
-
-def av_generate(
-    vec: np.ndarray,
-    av_model_path: str,
-    sglang_url: str,
-    max_new_tokens: int,
-    temperature: float,
-    return_logprob: bool = False,
-    timeout: float = 120.0,
-) -> dict:
-    """Call the AV server once. Returns {text, logprobs?}.
-
-    logprobs is the list of generated-token logprobs (floats) when requested.
-    """
-    embeds = _build_av_embeds(vec, av_model_path)
-    sampling = {
-        "max_new_tokens": max_new_tokens,
-        "temperature": temperature,
-        "stop": ["</explanation>", "<|im_end|>"],
-    }
-    payload = {"input_embeds": embeds.tolist(), "sampling_params": sampling}
-    if return_logprob:
-        payload["return_logprob"] = True
-        # only need logprobs of generated tokens, not the (injected) prompt
-        payload["logprob_start_len"] = len(embeds)
-
-    resp = httpx.post(f"{sglang_url}/generate", json=payload, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
-    result = {"text": _clean_thought(data.get("text", ""))}
-
-    if return_logprob:
-        meta = data.get("meta_info", {}) or {}
-        # SGLang returns output_token_logprobs as [[logprob, token_id, token_text], ...]
+        text = out.get("text", "")
+        meta = out.get("meta_info", {}) or {}
+        # SGLang: output_token_logprobs = [[logprob, token_id, token_text], ...]
         otl = meta.get("output_token_logprobs") or []
-        result["logprobs"] = [float(t[0]) for t in otl if t and t[0] is not None]
-    return result
+        logprobs = [float(t[0]) for t in otl if t and t[0] is not None]
+
+        if extract_explanation:
+            m = EXPLANATION_RE.search(text)
+            text = m.group(1).strip() if m else text
+        return {"text": text, "logprobs": logprobs}
+
+
+# Module-level client, created once in main().
+_AV: NLAClientLP | None = None
+
+
+def av_text(vec: np.ndarray, max_new_tokens: int, temperature: float) -> str:
+    """Verbalize one RAW activation vector (NLAClient rescales it internally)."""
+    return _AV.generate(
+        vec, max_new_tokens=max_new_tokens, temperature=temperature
+    )
+
+
+def av_text_logprob(vec: np.ndarray, max_new_tokens: int, temperature: float) -> dict:
+    """Verbalize one RAW activation, returning {text, logprobs}."""
+    return _AV.generate_with_logprob(
+        vec, max_new_tokens=max_new_tokens, temperature=temperature
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -349,10 +294,13 @@ def semantic_entropy(emb: np.ndarray, threshold: float = 0.7) -> float:
 # The three measures
 # ---------------------------------------------------------------------------
 def measure_cross_token(
-    acts: np.ndarray, av_model_path: str, sglang_url: str,
-    max_new_tokens: int, max_positions: int, temperature: float,
+    acts: np.ndarray, max_new_tokens: int, max_positions: int, temperature: float,
 ) -> dict:
-    """M1: verbalize each token's activation, embed, measure cross-token agreement."""
+    """M1: verbalize each token's activation, embed, measure cross-token agreement.
+
+    `acts` are RAW (un-normalized) activations; NLAClient rescales each to the
+    checkpoint's injection_scale internally.
+    """
     seq_len = acts.shape[0]
     # Evenly subsample token positions if the sequence is long.
     if seq_len > max_positions:
@@ -361,12 +309,10 @@ def measure_cross_token(
     else:
         positions = list(range(seq_len))
 
-    thoughts = []
-    for pos in positions:
-        vec = normalize_activation(acts[pos], AV_TARGET_NORM)
-        out = av_generate(vec, av_model_path, sglang_url,
-                          max_new_tokens=max_new_tokens, temperature=temperature)
-        thoughts.append(out["text"])
+    thoughts = [
+        av_text(acts[pos], max_new_tokens=max_new_tokens, temperature=temperature)
+        for pos in positions
+    ]
 
     emb = embed_texts(thoughts)
     return {
@@ -378,13 +324,11 @@ def measure_cross_token(
 
 
 def measure_perplexity(
-    last_vec: np.ndarray, av_model_path: str, sglang_url: str,
-    max_new_tokens: int, temperature: float,
+    last_vec: np.ndarray, max_new_tokens: int, temperature: float,
 ) -> dict:
     """M2: average log-p / perplexity of the AV's last-token thought."""
-    out = av_generate(last_vec, av_model_path, sglang_url,
-                      max_new_tokens=max_new_tokens, temperature=temperature,
-                      return_logprob=True)
+    out = av_text_logprob(last_vec, max_new_tokens=max_new_tokens,
+                          temperature=temperature)
     lps = out.get("logprobs", [])
     if lps:
         mean_logp = float(np.mean(lps))
@@ -401,19 +345,17 @@ def measure_perplexity(
 
 
 def measure_sampling_stability(
-    last_vec: np.ndarray, av_model_path: str, sglang_url: str,
-    max_new_tokens: int, k: int, temperature: float,
+    last_vec: np.ndarray, max_new_tokens: int, k: int, temperature: float,
 ) -> dict:
     """M3: sample the AV k times for the same activation, measure agreement.
 
     Requires temperature > 0, otherwise every sample is identical and the
     measure degenerates (cosine=1.0, entropy=0).
     """
-    samples = []
-    for _ in range(k):
-        out = av_generate(last_vec, av_model_path, sglang_url,
-                          max_new_tokens=max_new_tokens, temperature=temperature)
-        samples.append(out["text"])
+    samples = [
+        av_text(last_vec, max_new_tokens=max_new_tokens, temperature=temperature)
+        for _ in range(k)
+    ]
     emb = embed_texts(samples)
     return {
         "k": k,
@@ -441,6 +383,7 @@ def wait_for_av(url: str):
 
 
 def main():
+    global _AV
     args = parse_args()
 
     examples = load_dataset(args.dataset, args.eval)
@@ -461,6 +404,8 @@ def main():
     print("Qwen loaded.")
 
     wait_for_av(AV_SGLANG_URL)
+    print(f"\nLoading NLAClient from {AV_CHECKPOINT_DIR} ...")
+    _AV = NLAClientLP(AV_CHECKPOINT_DIR, sglang_url=AV_SGLANG_URL)
 
     out_f = open(args.output, "w")
     for ex in examples:
@@ -472,21 +417,21 @@ def main():
         acts, toks = extract_all_token_activations(
             model, tokenizer, text, QWEN_LAYER, QWEN_DEVICE
         )
-        last_vec = normalize_activation(acts[-1], AV_TARGET_NORM)
+        last_vec = acts[-1]   # raw; NLAClient rescales to injection_scale
         print(f"  seq_len={acts.shape[0]} d_model={acts.shape[1]}")
 
         m1 = measure_cross_token(
-            acts, AV_MODEL, AV_SGLANG_URL,
+            acts,
             max_new_tokens=args.max_tokens_per_token,
             max_positions=args.max_seq_tokens,
             temperature=args.temperature,
         )
         m2 = measure_perplexity(
-            last_vec, AV_MODEL, AV_SGLANG_URL, max_new_tokens=args.max_tokens,
+            last_vec, max_new_tokens=args.max_tokens,
             temperature=args.temperature,
         )
         m3 = measure_sampling_stability(
-            last_vec, AV_MODEL, AV_SGLANG_URL,
+            last_vec,
             max_new_tokens=args.max_tokens, k=args.k_samples,
             temperature=args.temperature,
         )

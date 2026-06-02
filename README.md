@@ -10,6 +10,8 @@ Runs sentences through **Qwen2.5-7B-Instruct-AWQ** (GPU 0), extracts last-token 
 |------|---------|
 | `test.txt` | Input sentences (TSV: `index\tsentence`) |
 | `run_rq2.py` | **RQ2** stability pipeline (3 measures + dataset-label join) |
+| `nla_inference.py` | Vendored official NLA client (kitft/nla-inference, Apache-2.0) |
+| `NLA_INFERENCE_LICENSE` | License for the vendored client |
 | `legacy/run_nla.py` | Original basic pipeline (one thought per sentence) |
 | `result.txt` | `legacy/run_nla.py` output (`index\tactivation_l2\tthought`) |
 | `rq2_metrics.jsonl` | `run_rq2.py` output (one metrics+labels row per example) |
@@ -57,7 +59,11 @@ Paths are relative to the project directory (mounted at `/app/data` inside the c
 ### 1. Install dependencies
 
 ```bash
+# legacy/run_nla.py (AWQ):
 pip install torch transformers accelerate autoawq httpx numpy "sglang[all]>=0.5.6"
+
+# run_rq2.py additionally needs (for the vendored NLA client + embedder):
+pip install orjson pyyaml safetensors sentence-transformers
 ```
 
 ### 2. Start the AV SGLang server on GPU 1
@@ -127,34 +133,56 @@ index	activation_l2	thought
 model's uncertainty — and therefore its propensity to hallucinate.
 
 For each example in the HalluLens dataset, `run_rq2.py` extracts Qwen's layer-20
-activations and computes three stability measures via the AV server, then joins
-each row with the dataset's hallucination labels so the signals can be
-correlated against ground truth offline.
+activations and computes three stability measures, then joins each row with the
+dataset's hallucination labels so the signals can be correlated against ground
+truth offline. Verbalization goes through the **vendored official NLA client**
+([`nla_inference.py`](nla_inference.py), from
+[kitft/nla-inference](https://github.com/kitft/nla-inference), Apache-2.0). That
+client reads the checkpoint's `nla_meta.yaml` and handles the trained prompt
+template, the neighbor-verified injection position, the injection scale, and the
+architecture embed scale automatically — so none of that is hardcoded here.
+`run_rq2.py` subclasses it (`NLAClientLP`) only to add logprobs for M2.
 
 | Measure | What it computes | Intuition |
 |---------|------------------|-----------|
 | **M1 cross-token similarity** | Verbalize *every* token's activation, embed the thoughts, report mean pairwise cosine + a semantic-entropy estimate | The NLA paper notes claims recurring across adjacent tokens are more reliable; low cross-token agreement ⇒ unstable internal "story" |
 | **M2 perplexity** | Ask the AV for token logprobs on the last-token thought; report mean log-p and `exp(−mean log-p)` | High perplexity ⇒ the verbalizer is unsure how to describe the activation |
-| **M3 sampling stability** | Sample the AV `k` times at `T=1` for the same activation; report mean pairwise cosine + semantic entropy over the `k` thoughts | High disagreement across samples ⇒ unstable description ⇒ model uncertainty |
+| **M3 sampling stability** | Sample the AV `k` times for the same activation; report mean pairwise cosine + semantic entropy over the `k` thoughts | High disagreement across samples ⇒ unstable description ⇒ model uncertainty |
 
-### Run
+### Setup
 
-The AV SGLang server must be started **with logprobs enabled** (M2 needs them):
+The NLA client needs the AV checkpoint **on local disk** (for its `nla_meta.yaml`
+sidecar), and the SGLang server must serve that **same local dir**. Download it
+once:
+
+```bash
+huggingface-cli download kitft/nla-qwen2.5-7b-L20-av \
+    --local-dir ./nla-qwen2.5-7b-L20-av
+```
+
+Start the AV SGLang server from that dir (`--disable-radix-cache` is **required**
+for `input_embeds`; logprobs are requested per-call by `NLAClientLP`):
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 python -m sglang.launch_server \
-    --model-path kitft/nla-qwen2.5-7b-L20-av \
+    --model-path ./nla-qwen2.5-7b-L20-av \
     --port 30000 --disable-radix-cache --dtype bfloat16
 ```
 
-Also install the sentence embedder used for M1/M3 similarity:
+Install the extra deps the client + embedder need:
 
 ```bash
-pip install sentence-transformers
+pip install sentence-transformers orjson pyyaml safetensors
 ```
 
-Then run the pipeline. The `--dataset`/`--eval` defaults already point at the
-bundled `Hallulens Dataset/` folder, so the smoke test needs no paths.
+`run_rq2.py` finds the checkpoint via `AV_CHECKPOINT_DIR` (default
+`./nla-qwen2.5-7b-L20-av`) and the server via `AV_SGLANG_URL`
+(default `http://localhost:30000`).
+
+### Run
+
+The `--dataset`/`--eval` defaults already point at the bundled
+`Hallulens Dataset/` folder, so the smoke test needs no paths.
 
 **Smoke test** — first 10 examples, fewer samples / shorter sequences, finishes
 in a couple of minutes; sanity-checks the GPU + AV server wiring end to end:

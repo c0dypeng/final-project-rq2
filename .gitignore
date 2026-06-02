@@ -8,5 +8,8 @@ venv/
 result.txt
 rq2_metrics.jsonl
 
+# Downloaded NLA AV checkpoint (multi-GB; fetch via huggingface-cli)
+nla-qwen2.5-7b-L20-av/
+
 # OS
 .DS_Store
